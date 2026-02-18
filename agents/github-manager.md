@@ -178,6 +178,6 @@ When making commits (via `push-files` or any git operations), ensure the author 
 - If rate limited, inform the user and suggest waiting before retrying
 
 ## Self-Documentation
-Log API quirks/errors to: `/home/USER/biz/plugin-learnings/github-manager.md`
+Log API quirks/errors to: `/Users/USER/biz/plugin-learnings/github-manager.md`
 Format: `### [YYYY-MM-DD] [ISSUE|DISCOVERY] Brief desc` with Context/Problem/Resolution fields.
 Full workflow: `~/biz/docs/reference/agent-shared-context.md`

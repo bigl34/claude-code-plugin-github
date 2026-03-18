@@ -116,27 +116,6 @@ node dist/cli.js list-commits --repo owner/name [--limit 10] [--branch main]
 node dist/cli.js get-commit --repo owner/name --sha abc123
 ```
 
-## GitHub Account
-
-**Important:** Repositories are under the `YOUR_GITHUB_USER` user account (personal account), NOT a "YOUR_COMPANY" organization.
-
-Examples:
-- `--repo YOUR_GITHUB_USER/inflow-mcp-server` (correct)
-- `--repo YOUR_COMPANY/inflow-mcp-server` (incorrect - will fail)
-
-## Key Repositories
-
-The user primarily works with:
-- **YOUR_GITHUB_USER/inflow-mcp-server** - Custom MCP server for inFlow Inventory integration
-- Other repositories under the `YOUR_GITHUB_USER` account
-
-## Commit Attribution
-
-**IMPORTANT:** All commits must be attributed to `YOUR_GITHUB_USER`. The git config is set globally to:
-- user.name: `YOUR_GITHUB_USER`
-- user.email: `YOUR_GITHUB_EMAIL`
-
-When making commits (via `push-files` or any git operations), ensure the author is `YOUR_GITHUB_USER`. Do NOT use "YOUR_NAME", "Claude", or any other attribution.
 
 ## Operational Guidelines
 

@@ -3,7 +3,7 @@
 
 GitHub repository, issue, and PR management via gh CLI
 
-![Version](https://img.shields.io/badge/version-1.2.0-blue) ![License: MIT](https://img.shields.io/badge/License-MIT-green) ![Node >= 18](https://img.shields.io/badge/node-%3E%3D18-brightgreen)
+![Version](https://img.shields.io/badge/version-1.2.1-blue) ![License: MIT](https://img.shields.io/badge/License-MIT-green) ![Node >= 18](https://img.shields.io/badge/node-%3E%3D18-brightgreen)
 
 ## Prerequisites
 
@@ -14,7 +14,7 @@ GitHub repository, issue, and PR management via gh CLI
 ## Quick Start
 
 ```bash
-git clone https://github.com/YOUR_GITHUB_USER/claude-code-plugin-github.git
+git clone https://github.com/bigl34/claude-code-plugin-github.git
 cd claude-code-plugin-github
 cp config.template.json config.json  # fill in your credentials
 cd scripts && npm install

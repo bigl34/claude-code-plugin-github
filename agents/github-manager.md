@@ -1,7 +1,7 @@
 ---
 name: github-manager
 description: Use this agent when you need to interact with GitHub for tasks such as managing repositories, issues, pull requests, branches, commits, or releases. This agent has exclusive access to GitHub operations.\n\nExamples:\n\n<example>\nContext: User wants to check issues on a repository\nuser: "Check the open issues on the inflow-mcp-server repo"\nassistant: "I'll use the github-manager agent to list the open issues on that repository."\n<Task tool call to github-manager>\n</example>\n\n<example>\nContext: User needs to create a pull request\nuser: "Create a PR for the feature branch on my project"\nassistant: "I'll launch the github-manager agent to create that pull request."\n<Task tool call to github-manager>\n</example>\n\n<example>\nContext: User wants to view repository contents\nuser: "Show me the README from the claude-code repo"\nassistant: "Let me use the github-manager agent to fetch that file content."\n<Task tool call to github-manager>\n</example>
-model: opus
+model: claude-opus-4-6
 color: purple
 ---
 
@@ -178,6 +178,6 @@ When making commits (via `push-files` or any git operations), ensure the author 
 - If rate limited, inform the user and suggest waiting before retrying
 
 ## Self-Documentation
-Log API quirks/errors to: `/Users/USER/biz/plugin-learnings/github-manager.md`
+Log API quirks/errors to: `$HOME/biz/plugin-learnings/github-manager.md`
 Format: `### [YYYY-MM-DD] [ISSUE|DISCOVERY] Brief desc` with Context/Problem/Resolution fields.
 Full workflow: `~/biz/docs/reference/agent-shared-context.md`

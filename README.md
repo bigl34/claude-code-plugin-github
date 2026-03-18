@@ -3,7 +3,7 @@
 
 GitHub repository, issue, and PR management via gh CLI
 
-![Version](https://img.shields.io/badge/version-1.1.7-blue) ![License: MIT](https://img.shields.io/badge/License-MIT-green) ![Node >= 18](https://img.shields.io/badge/node-%3E%3D18-brightgreen)
+![Version](https://img.shields.io/badge/version-1.2.0-blue) ![License: MIT](https://img.shields.io/badge/License-MIT-green) ![Node >= 18](https://img.shields.io/badge/node-%3E%3D18-brightgreen)
 
 ## Prerequisites
 
@@ -28,14 +28,6 @@ cd scripts && npm install
    ```bash
    cd scripts && npm install
    ```
-
-## Configuration
-
-Copy `config.template.json` to `config.json` and fill in the required values:
-
-| Field | Placeholder |
-|-------|-------------|
-| `credentials_path` | `/path/to/your/credentials` |
 
 ## Available Commands
 

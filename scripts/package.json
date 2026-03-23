@@ -1,0 +1,15 @@
+{
+  "name": "github-manager-scripts",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@local/cli-utils": "github:bigl34/claude-code-plugin-shared"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "typescript": "^5.3.0"
+  }
+}

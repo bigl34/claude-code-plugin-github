@@ -1,0 +1,5 @@
+{
+  "name": "github-manager",
+  "version": "1.2.1",
+  "description": "GitHub repository, issue, and PR management via gh CLI"
+}

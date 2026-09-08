@@ -1,16 +1,21 @@
 #!/usr/bin/env npx tsx
-/**
- * GitHub Manager CLI
- *
- * Zod-validated CLI for GitHub operations via gh CLI.
- */
 
-import { z, createCommand, runCli, cliTypes } from "@local/cli-utils";
+import {
+  z,
+  createCommand,
+  runCli,
+  cliTypes,
+  wrapUntrustedField,
+  buildSafeOutput,
+  TRUNCATION_DEFAULTS,
+} from "@local/cli-utils";
 import { execFileSync, spawnSync } from "child_process";
+import {
+  extractLogin,
+  wrapIssueOrPrDetail,
+} from "./wrap.js";
+import { fileURLToPath } from "url";
 
-// =============================================================================
-// TYPES
-// =============================================================================
 
 interface CommitNode {
   oid: string;
@@ -46,9 +51,6 @@ interface GraphQLSingleCommitResponse {
   errors?: Array<{ message: string }>;
 }
 
-// =============================================================================
-// UTILITIES
-// =============================================================================
 
 function parseRepoArg(repoArg: string): { owner: string; repo: string } {
   const parts = repoArg.split("/");
@@ -58,7 +60,9 @@ function parseRepoArg(repoArg: string): { owner: string; repo: string } {
   return { owner: parts[0], repo: parts[1] };
 }
 
-function runGh(args: string[]): string {
+type GhRunner = (args: string[]) => string;
+
+function defaultRunGh(args: string[]): string {
   try {
     const result = execFileSync("gh", args, {
       encoding: "utf-8",
@@ -71,6 +75,56 @@ function runGh(args: string[]): string {
     }
     throw new Error(`gh command failed: ${error.message}`);
   }
+}
+
+let ghRunner: GhRunner = defaultRunGh;
+
+export function setRunGhForTests(runner: GhRunner | null): void {
+  ghRunner = runner ?? defaultRunGh;
+}
+
+function runGh(args: string[]): string {
+  return ghRunner(args);
+}
+
+function parseJson<T>(text: string, context: string): T {
+  try {
+    return JSON.parse(text) as T;
+  } catch (error) {
+    throw new Error(`${context}: failed to parse gh JSON output: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+interface RepoView {
+  name?: string;
+  url?: string;
+  visibility?: string;
+  description?: string | null;
+  owner?: { login?: string } | string | null;
+}
+
+function repoNameFromFullName(fullName: string): string {
+  return fullName.includes("/") ? fullName.split("/").pop()! : fullName;
+}
+
+function getRepoView(repo: string, attempts = 3): RepoView {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      return parseJson<RepoView>(
+        runGh(["repo", "view", repo, "--json", "name,url,visibility,description,owner"]),
+        `gh repo view ${repo}`,
+      );
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+function ownerLoginFromRepoView(data: RepoView): string {
+  if (typeof data.owner === "object" && data.owner != null) return data.owner.login ?? "";
+  return String(data.owner ?? "");
 }
 
 function runGhGraphQL(query: string, variables: Record<string, any>): string {
@@ -96,14 +150,11 @@ function runGhGraphQL(query: string, variables: Record<string, any>): string {
   }
 }
 
-// Dummy client class (gh CLI is the actual implementation)
 class GitHubCLI {
   constructor() {}
 }
 
-// Define commands with Zod schemas
-const commands = {
-  // ==================== Repository Operations ====================
+export const commands = {
   "create-repo": createCommand(
     z.object({
       name: z.string().min(1).describe("Repository name"),
@@ -111,12 +162,28 @@ const commands = {
       description: z.string().optional().describe("Repository description"),
     }),
     async (args) => {
-      const cmdArgs = ["repo", "create", args.name as string, "--json", "name,url,private,description"];
-      if (args.private) cmdArgs.push("--private");
+      const cmdArgs = ["repo", "create", args.name as string, args.private ? "--private" : "--public"];
       if (args.description) cmdArgs.push("--description", args.description as string);
-      return JSON.parse(runGh(cmdArgs));
+      runGh(cmdArgs);
+      const data = getRepoView(args.name as string);
+      return buildSafeOutput(
+        {
+          command: "create-repo",
+          name: data.name,
+          url: data.url,
+          private: data.visibility === "PRIVATE",
+        },
+        {
+          description: wrapUntrustedField(
+            "description",
+            data.description ?? "",
+            { maxChars: TRUNCATION_DEFAULTS.body }
+          ),
+        }
+      );
     },
-    "Create a new repository"
+    "Create a new repository",
+    { sideEffect: "write" }
   ),
 
   "fork-repo": createCommand(
@@ -125,11 +192,34 @@ const commands = {
       org: z.string().optional().describe("Target organization"),
     }),
     async (args) => {
-      const cmdArgs = ["repo", "fork", args.repo as string, "--clone=false", "--json", "name,url,owner"];
+      const sourceRepo = args.repo as string;
+      const cmdArgs = ["repo", "fork", sourceRepo, "--clone=false"];
       if (args.org) cmdArgs.push("--org", args.org as string);
-      return JSON.parse(runGh(cmdArgs));
+      runGh(cmdArgs);
+      const targetOwner = args.org
+        ? args.org as string
+        : runGh(["api", "user", "--jq", ".login"]);
+      const data = getRepoView(`${targetOwner}/${repoNameFromFullName(sourceRepo)}`);
+      const ownerLogin = ownerLoginFromRepoView(data);
+      return buildSafeOutput(
+        {
+          command: "fork-repo",
+          name: data.name,
+          url: data.url,
+        },
+        {
+          owner: {
+            login: wrapUntrustedField(
+              "owner.login",
+              ownerLogin,
+              { maxChars: TRUNCATION_DEFAULTS.displayName }
+            ),
+          },
+        }
+      );
     },
-    "Fork a repository"
+    "Fork a repository",
+    { sideEffect: "write" }
   ),
 
   "get-contents": createCommand(
@@ -144,12 +234,71 @@ const commands = {
       if (args.branch) endpoint += `?ref=${args.branch}`;
       const result = runGh(["api", endpoint]);
       const data = JSON.parse(result);
-      if (data.type === "file" && data.content) {
-        data.decoded_content = Buffer.from(data.content, "base64").toString("utf-8");
+
+      if (Array.isArray(data)) {
+        const entries = data.map((entry: any, i: number) => ({
+          type: entry.type,
+          size: entry.size,
+          sha: entry.sha,
+          url: entry.url,
+          name: wrapUntrustedField(
+            `entries[${i}].name`,
+            entry.name ?? "",
+            { maxChars: TRUNCATION_DEFAULTS.subject }
+          ),
+          path: wrapUntrustedField(
+            `entries[${i}].path`,
+            entry.path ?? "",
+            { maxChars: TRUNCATION_DEFAULTS.subject }
+          ),
+        }));
+        return buildSafeOutput(
+          {
+            command: "get-contents",
+            repo: args.repo,
+            kind: "directory",
+            count: entries.length,
+          },
+          { entries }
+        );
       }
-      return data;
+
+      let decodedContent = "";
+      if (data.type === "file" && data.content) {
+        decodedContent = Buffer.from(data.content, "base64").toString("utf-8");
+      }
+      return buildSafeOutput(
+        {
+          command: "get-contents",
+          repo: args.repo,
+          kind: "file",
+          type: data.type,
+          size: data.size,
+          sha: data.sha,
+          url: data.url,
+          encoding: data.encoding,
+        },
+        {
+          name: wrapUntrustedField(
+            "name",
+            data.name ?? "",
+            { maxChars: TRUNCATION_DEFAULTS.subject }
+          ),
+          path: wrapUntrustedField(
+            "path",
+            data.path ?? "",
+            { maxChars: TRUNCATION_DEFAULTS.subject }
+          ),
+          decoded_content: wrapUntrustedField(
+            "decoded_content",
+            decodedContent,
+            { maxChars: TRUNCATION_DEFAULTS.body }
+          ),
+        }
+      );
     },
-    "Get file/directory contents"
+    "Get file/directory contents",
+    { sideEffect: "read" }
   ),
 
   "search-repos": createCommand(
@@ -164,12 +313,43 @@ const commands = {
         "--json", "fullName,description,url,stargazersCount,updatedAt,visibility",
         "--limit", String(limit)
       ]);
-      return JSON.parse(result);
+      const data = JSON.parse(result) as Array<{
+        fullName?: string;
+        description?: string;
+        url?: string;
+        stargazersCount?: number;
+        updatedAt?: string;
+        visibility?: string;
+      }>;
+      const results = data.map((repo, i) => ({
+        url: repo.url,
+        stargazersCount: repo.stargazersCount,
+        updatedAt: repo.updatedAt,
+        visibility: repo.visibility,
+        fullName: wrapUntrustedField(
+          `results[${i}].fullName`,
+          repo.fullName ?? "",
+          { maxChars: TRUNCATION_DEFAULTS.subject }
+        ),
+        description: wrapUntrustedField(
+          `results[${i}].description`,
+          repo.description ?? "",
+          { maxChars: TRUNCATION_DEFAULTS.body }
+        ),
+      }));
+      return buildSafeOutput(
+        {
+          command: "search-repos",
+          query: args.query,
+          count: results.length,
+        },
+        { results }
+      );
     },
-    "Search repositories"
+    "Search repositories",
+    { sideEffect: "read" }
   ),
 
-  // ==================== Issue Operations ====================
   "list-issues": createCommand(
     z.object({
       repo: z.string().min(1).describe("Repository (owner/name)"),
@@ -184,9 +364,65 @@ const commands = {
         "--limit", String((args.limit as number | undefined) || 30)
       ];
       if (args.state) cmdArgs.push("--state", args.state as string);
-      return JSON.parse(runGh(cmdArgs));
+      const data = JSON.parse(runGh(cmdArgs)) as Array<{
+        number?: number;
+        title?: string;
+        state?: string;
+        author?: { login?: string } | string;
+        labels?: Array<{ name?: string } | string>;
+        createdAt?: string;
+        updatedAt?: string;
+        url?: string;
+      }>;
+      const results = data.map((issue, i) => {
+        const authorLogin =
+          typeof issue.author === "object" && issue.author != null
+            ? (issue.author.login ?? "")
+            : String(issue.author ?? "");
+        const labelNames = Array.isArray(issue.labels)
+          ? issue.labels.map((l) =>
+              typeof l === "object" && l != null ? (l.name ?? "") : String(l ?? "")
+            )
+          : [];
+        return {
+          number: issue.number,
+          state: issue.state,
+          createdAt: issue.createdAt,
+          updatedAt: issue.updatedAt,
+          url: issue.url,
+          title: wrapUntrustedField(
+            `results[${i}].title`,
+            issue.title ?? "",
+            { maxChars: TRUNCATION_DEFAULTS.subject }
+          ),
+          author: {
+            login: wrapUntrustedField(
+              `results[${i}].author.login`,
+              authorLogin,
+              { maxChars: TRUNCATION_DEFAULTS.displayName }
+            ),
+          },
+          labels: labelNames.map((name, j) =>
+            wrapUntrustedField(
+              `results[${i}].labels[${j}]`,
+              name,
+              { maxChars: TRUNCATION_DEFAULTS.displayName }
+            )
+          ),
+        };
+      });
+      return buildSafeOutput(
+        {
+          command: "list-issues",
+          repo: args.repo,
+          state: args.state,
+          count: results.length,
+        },
+        { results }
+      );
     },
-    "List issues"
+    "List issues",
+    { sideEffect: "read" }
   ),
 
   "get-issue": createCommand(
@@ -200,9 +436,11 @@ const commands = {
         "--repo", args.repo as string,
         "--json", "number,title,state,body,author,labels,assignees,milestone,createdAt,updatedAt,url,comments"
       ]);
-      return JSON.parse(result);
+      const issue = JSON.parse(result);
+      return wrapIssueOrPrDetail(issue, args.repo as string, "get-issue");
     },
-    "Get issue details"
+    "Get issue details",
+    { sideEffect: "read" }
   ),
 
   "create-issue": createCommand(
@@ -219,7 +457,8 @@ const commands = {
       const result = runGh(cmdArgs);
       return { url: result, message: "Issue created" };
     },
-    "Create an issue"
+    "Create an issue",
+    { sideEffect: "write" }
   ),
 
   "update-issue": createCommand(
@@ -247,15 +486,16 @@ const commands = {
         runGh(editArgs);
       }
 
-      // Return updated issue
       const result = runGh([
         "issue", "view", String(number),
         "--repo", repo,
         "--json", "number,title,state,body,author,labels,assignees,milestone,createdAt,updatedAt,url,comments"
       ]);
-      return JSON.parse(result);
+      const issue = JSON.parse(result);
+      return wrapIssueOrPrDetail(issue, repo, "update-issue");
     },
-    "Update an issue"
+    "Update an issue",
+    { sideEffect: "write" }
   ),
 
   "add-comment": createCommand(
@@ -272,7 +512,8 @@ const commands = {
       ]);
       return { success: true, issue: args.number, message: "Comment added" };
     },
-    "Add comment to issue/PR"
+    "Add comment to issue/PR",
+    { sideEffect: "write" }
   ),
 
   "search-issues": createCommand(
@@ -286,12 +527,59 @@ const commands = {
         "--json", "number,title,state,repository,author,createdAt,url",
         "--limit", String((args.limit as number | undefined) || 30)
       ]);
-      return JSON.parse(result);
+      const data = JSON.parse(result) as Array<{
+        number?: number;
+        title?: string;
+        state?: string;
+        repository?: { name?: string; nameWithOwner?: string } | string;
+        author?: unknown;
+        createdAt?: string;
+        url?: string;
+      }>;
+      const results = data.map((issue, i) => {
+        const repoFullName =
+          typeof issue.repository === "object" && issue.repository != null
+            ? (issue.repository.nameWithOwner ?? issue.repository.name ?? "")
+            : String(issue.repository ?? "");
+        return {
+          number: issue.number,
+          state: issue.state,
+          createdAt: issue.createdAt,
+          url: issue.url,
+          title: wrapUntrustedField(
+            `results[${i}].title`,
+            issue.title ?? "",
+            { maxChars: TRUNCATION_DEFAULTS.subject }
+          ),
+          author: {
+            login: wrapUntrustedField(
+              `results[${i}].author.login`,
+              extractLogin(issue.author),
+              { maxChars: TRUNCATION_DEFAULTS.displayName }
+            ),
+          },
+          repository: {
+            full_name: wrapUntrustedField(
+              `results[${i}].repository.full_name`,
+              repoFullName,
+              { maxChars: TRUNCATION_DEFAULTS.subject }
+            ),
+          },
+        };
+      });
+      return buildSafeOutput(
+        {
+          command: "search-issues",
+          query: args.query,
+          count: results.length,
+        },
+        { results }
+      );
     },
-    "Search issues"
+    "Search issues",
+    { sideEffect: "read" }
   ),
 
-  // ==================== Pull Request Operations ====================
   "list-prs": createCommand(
     z.object({
       repo: z.string().min(1).describe("Repository (owner/name)"),
@@ -306,9 +594,49 @@ const commands = {
         "--limit", String((args.limit as number | undefined) || 30)
       ];
       if (args.state) cmdArgs.push("--state", args.state as string);
-      return JSON.parse(runGh(cmdArgs));
+      const data = JSON.parse(runGh(cmdArgs)) as Array<any>;
+      const results = data.map((pr, i) => ({
+        number: pr.number,
+        state: pr.state,
+        isDraft: pr.isDraft,
+        createdAt: pr.createdAt,
+        updatedAt: pr.updatedAt,
+        url: pr.url,
+        title: wrapUntrustedField(
+          `results[${i}].title`,
+          pr.title ?? "",
+          { maxChars: TRUNCATION_DEFAULTS.subject }
+        ),
+        author: {
+          login: wrapUntrustedField(
+            `results[${i}].author.login`,
+            extractLogin(pr.author),
+            { maxChars: TRUNCATION_DEFAULTS.displayName }
+          ),
+        },
+        headRefName: wrapUntrustedField(
+          `results[${i}].headRefName`,
+          pr.headRefName ?? "",
+          { maxChars: TRUNCATION_DEFAULTS.displayName }
+        ),
+        baseRefName: wrapUntrustedField(
+          `results[${i}].baseRefName`,
+          pr.baseRefName ?? "",
+          { maxChars: TRUNCATION_DEFAULTS.displayName }
+        ),
+      }));
+      return buildSafeOutput(
+        {
+          command: "list-prs",
+          repo: args.repo,
+          state: args.state,
+          count: results.length,
+        },
+        { results }
+      );
     },
-    "List pull requests"
+    "List pull requests",
+    { sideEffect: "read" }
   ),
 
   "get-pr": createCommand(
@@ -322,9 +650,11 @@ const commands = {
         "--repo", args.repo as string,
         "--json", "number,title,state,body,author,headRefName,baseRefName,labels,assignees,reviewRequests,reviews,createdAt,updatedAt,url,isDraft,mergeable,additions,deletions,changedFiles"
       ]);
-      return JSON.parse(result);
+      const pr = JSON.parse(result);
+      return wrapIssueOrPrDetail(pr, args.repo as string, "get-pr");
     },
-    "Get PR details"
+    "Get PR details",
+    { sideEffect: "read" }
   ),
 
   "create-pr": createCommand(
@@ -349,7 +679,8 @@ const commands = {
       const result = runGh(cmdArgs);
       return { url: result, message: "PR created" };
     },
-    "Create a pull request"
+    "Create a pull request",
+    { sideEffect: "write" }
   ),
 
   "merge-pr": createCommand(
@@ -371,7 +702,8 @@ const commands = {
       runGh(cmdArgs);
       return { success: true, pr: args.number, message: `PR merged via ${method || "merge"}` };
     },
-    "Merge a pull request"
+    "Merge a pull request",
+    { sideEffect: "external_send", requiresConfirmation: true }
   ),
 
   "create-review": createCommand(
@@ -391,7 +723,8 @@ const commands = {
       runGh(cmdArgs);
       return { success: true, pr: args.number, event, message: "Review submitted" };
     },
-    "Create a PR review"
+    "Create a PR review",
+    { sideEffect: "write" }
   ),
 
   "get-pr-files": createCommand(
@@ -401,10 +734,77 @@ const commands = {
     }),
     async (args) => {
       const { owner, repo } = parseRepoArg(args.repo as string);
-      const result = runGh(["api", `repos/${owner}/${repo}/pulls/${args.number}/files`]);
-      return JSON.parse(result);
+      const result = runGh([
+        "api",
+        "--paginate",
+        `repos/${owner}/${repo}/pulls/${args.number}/files`,
+        "-F",
+        "per_page=100",
+        "--jq",
+        ".[]",
+      ]);
+      const data = result.trim()
+        ? result.split(/\n+/).filter(Boolean).map((line) => parseJson<{
+          filename?: string;
+          previous_filename?: string;
+          sha?: string;
+          status?: string;
+          additions?: number;
+          deletions?: number;
+          changes?: number;
+          patch?: string;
+        }>(line, "gh api pull files page"))
+        : [] as Array<{
+        filename?: string;
+        previous_filename?: string;
+        sha?: string;
+        status?: string;
+        additions?: number;
+        deletions?: number;
+        changes?: number;
+        patch?: string;
+      }>;
+      const files = data.map((file, i) => {
+        const wrapped: Record<string, unknown> = {
+          sha: file.sha,
+          status: file.status,
+          additions: file.additions,
+          deletions: file.deletions,
+          changes: file.changes,
+          filename: wrapUntrustedField(
+            `files[${i}].filename`,
+            file.filename ?? "",
+            { maxChars: TRUNCATION_DEFAULTS.subject }
+          ),
+        };
+        if (file.previous_filename !== undefined) {
+          wrapped.previous_filename = wrapUntrustedField(
+            `files[${i}].previous_filename`,
+            file.previous_filename ?? "",
+            { maxChars: TRUNCATION_DEFAULTS.subject }
+          );
+        }
+        if (file.patch !== undefined) {
+          wrapped.patch = wrapUntrustedField(
+            `files[${i}].patch`,
+            file.patch ?? "",
+            { maxChars: TRUNCATION_DEFAULTS.body }
+          );
+        }
+        return wrapped;
+      });
+      return buildSafeOutput(
+        {
+          command: "get-pr-files",
+          repo: args.repo,
+          pr_number: args.number,
+          count: files.length,
+        },
+        { files }
+      );
     },
-    "Get PR changed files"
+    "Get PR changed files",
+    { sideEffect: "read" }
   ),
 
   "get-pr-status": createCommand(
@@ -418,9 +818,46 @@ const commands = {
         "--repo", args.repo as string,
         "--json", "number,state,mergeable,mergeStateStatus,statusCheckRollup,reviews"
       ]);
-      return JSON.parse(result);
+      const data = JSON.parse(result) as {
+        number?: number;
+        state?: string;
+        mergeable?: string;
+        mergeStateStatus?: string;
+        statusCheckRollup?: Array<any>;
+        reviews?: Array<any>;
+      };
+      const reviews = Array.isArray(data.reviews)
+        ? data.reviews.map((r: any, i: number) => ({
+            id: r.id,
+            state: r.state,
+            submittedAt: r.submittedAt,
+            author_login: wrapUntrustedField(
+              `reviews[${i}].author_login`,
+              extractLogin(r.author),
+              { maxChars: TRUNCATION_DEFAULTS.displayName }
+            ),
+            body: wrapUntrustedField(
+              `reviews[${i}].body`,
+              r.body ?? "",
+              { maxChars: TRUNCATION_DEFAULTS.body }
+            ),
+          }))
+        : [];
+      return buildSafeOutput(
+        {
+          command: "get-pr-status",
+          repo: args.repo,
+          number: data.number,
+          state: data.state,
+          mergeable: data.mergeable,
+          mergeStateStatus: data.mergeStateStatus,
+          statusCheckRollup: data.statusCheckRollup,
+        },
+        { reviews }
+      );
     },
-    "Get PR status and checks"
+    "Get PR status and checks",
+    { sideEffect: "read" }
   ),
 
   "update-pr-branch": createCommand(
@@ -436,10 +873,10 @@ const commands = {
       ]);
       return { success: true, pr: args.number, message: "Branch updated", ...JSON.parse(result) };
     },
-    "Update PR branch from base"
+    "Update PR branch from base",
+    { sideEffect: "write" }
   ),
 
-  // ==================== Branch Operations ====================
   "create-branch": createCommand(
     z.object({
       repo: z.string().min(1).describe("Repository (owner/name)"),
@@ -461,10 +898,10 @@ const commands = {
       ]);
       return { success: true, branch: args.branch, sha, source: sourceRef, ...JSON.parse(result) };
     },
-    "Create a new branch"
+    "Create a new branch",
+    { sideEffect: "write" }
   ),
 
-  // ==================== File Operations ====================
   "push-files": createCommand(
     z.object({
       repo: z.string().min(1).describe("Repository (owner/name)"),
@@ -535,10 +972,10 @@ const commands = {
 
       return { success: true, commit: newCommitData.sha, message, files: files.map(f => f.path) };
     },
-    "Push files to a branch"
+    "Push files to a branch",
+    { sideEffect: "external_send", requiresConfirmation: true }
   ),
 
-  // ==================== Code Search ====================
   "search-code": createCommand(
     z.object({
       query: z.string().min(1).describe("Search query"),
@@ -550,12 +987,55 @@ const commands = {
         "--json", "path,repository,textMatches",
         "--limit", String((args.limit as number | undefined) || 30)
       ]);
-      return JSON.parse(result);
+      const data = JSON.parse(result) as Array<{
+        path?: string;
+        repository?: { name?: string; nameWithOwner?: string } | string;
+        textMatches?: Array<{ fragment?: string; property?: string }>;
+      }>;
+      const results = data.map((match, i) => {
+        const repoFullName =
+          typeof match.repository === "object" && match.repository != null
+            ? (match.repository.nameWithOwner ?? match.repository.name ?? "")
+            : String(match.repository ?? "");
+        const textMatches = Array.isArray(match.textMatches)
+          ? match.textMatches.map((tm, j) => ({
+              property: tm.property,
+              fragment: wrapUntrustedField(
+                `results[${i}].text_matches[${j}].fragment`,
+                tm.fragment ?? "",
+                { maxChars: TRUNCATION_DEFAULTS.snippet }
+              ),
+            }))
+          : [];
+        return {
+          path: wrapUntrustedField(
+            `results[${i}].path`,
+            match.path ?? "",
+            { maxChars: TRUNCATION_DEFAULTS.subject }
+          ),
+          repository: {
+            full_name: wrapUntrustedField(
+              `results[${i}].repository.full_name`,
+              repoFullName,
+              { maxChars: TRUNCATION_DEFAULTS.subject }
+            ),
+          },
+          text_matches: textMatches,
+        };
+      });
+      return buildSafeOutput(
+        {
+          command: "search-code",
+          query: args.query,
+          count: results.length,
+        },
+        { results }
+      );
     },
-    "Search code"
+    "Search code",
+    { sideEffect: "read" }
   ),
 
-  // ==================== Commit Operations ====================
   "list-commits": createCommand(
     z.object({
       repo: z.string().min(1).describe("Repository (owner/name)"),
@@ -612,20 +1092,39 @@ const commands = {
         throw new Error("No commit history found");
       }
 
-      const commits = history.nodes.map((node: CommitNode) => ({
+      const commits = history.nodes.map((node: CommitNode, i: number) => ({
         sha: node.oid,
         shortSha: node.oid.substring(0, 7),
-        message: node.message.split("\n")[0],
-        author: node.author.name,
         date: node.author.date,
         additions: node.additions,
         deletions: node.deletions,
         changedFiles: node.changedFilesIfAvailable,
+        message: wrapUntrustedField(
+          `commits[${i}].message`,
+          node.message.split("\n")[0],
+          { maxChars: TRUNCATION_DEFAULTS.subject }
+        ),
+        author: {
+          name: wrapUntrustedField(
+            `commits[${i}].author.name`,
+            node.author.name,
+            { maxChars: TRUNCATION_DEFAULTS.displayName }
+          ),
+        },
       }));
 
-      return { commits };
+      return buildSafeOutput(
+        {
+          command: "list-commits",
+          repo: args.repo,
+          branch: branch ?? "(default)",
+          count: commits.length,
+        },
+        { commits }
+      );
     },
-    "List commits"
+    "List commits",
+    { sideEffect: "read" }
   ),
 
   "get-commit": createCommand(
@@ -663,24 +1162,43 @@ const commands = {
         throw new Error(`Commit ${sha} not found`);
       }
 
-      return {
-        sha: commit.oid,
-        shortSha: commit.oid.substring(0, 7),
-        message: commit.message,
-        author: commit.author.name,
-        date: commit.author.date,
-        additions: commit.additions,
-        deletions: commit.deletions,
-        changedFiles: commit.changedFilesIfAvailable,
-        parents: commit.parents.nodes.map((p) => p.oid),
-      };
+      return buildSafeOutput(
+        {
+          command: "get-commit",
+          repo: args.repo,
+          sha: commit.oid,
+          shortSha: commit.oid.substring(0, 7),
+          date: commit.author.date,
+          additions: commit.additions,
+          deletions: commit.deletions,
+          changedFiles: commit.changedFilesIfAvailable,
+          parents: commit.parents.nodes.map((p) => p.oid),
+        },
+        {
+          message: wrapUntrustedField(
+            "message",
+            commit.message ?? "",
+            { maxChars: TRUNCATION_DEFAULTS.body }
+          ),
+          author: {
+            name: wrapUntrustedField(
+              "author.name",
+              commit.author.name,
+              { maxChars: TRUNCATION_DEFAULTS.displayName }
+            ),
+          },
+        }
+      );
     },
-    "Get commit details"
+    "Get commit details",
+    { sideEffect: "read" }
   ),
 };
 
-// Run CLI
-runCli(commands, GitHubCLI, {
-  programName: "github-cli",
-  description: "GitHub operations via gh CLI",
-});
+if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+  runCli(commands, GitHubCLI, {
+    programName: "github-cli",
+    description: "GitHub operations via gh CLI",
+  });
+}
+

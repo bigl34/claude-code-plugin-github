@@ -1,0 +1,88 @@
+#!/bin/sh
+set -eu
+
+PATH="$HOME/go/bin:/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH"
+export PATH
+
+command -v github-mcp-server >/dev/null 2>&1 || { echo "github-mcp launcher: 'github-mcp-server' not found in PATH" >&2; exit 1; }
+
+use_token() {
+  [ -n "${1:-}" ] || return 1
+  GITHUB_PERSONAL_ACCESS_TOKEN="$1"
+  export GITHUB_PERSONAL_ACCESS_TOKEN
+  return 0
+}
+
+token_from_json() {
+  [ -r "$1" ] || return 1
+
+  if command -v node >/dev/null 2>&1; then
+    token=$(
+      node -e '
+const fs = require("fs");
+const cfg = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+const token =
+  cfg?.mcpServers?.github?.env?.GITHUB_PERSONAL_ACCESS_TOKEN ||
+  cfg?.mcpServer?.env?.GITHUB_PERSONAL_ACCESS_TOKEN ||
+  cfg?.env?.GITHUB_PERSONAL_ACCESS_TOKEN ||
+  cfg?.GITHUB_PERSONAL_ACCESS_TOKEN ||
+  cfg?.github?.personalAccessToken ||
+  cfg?.github?.token;
+if (token) process.stdout.write(token);
+' "$1" 2>/dev/null
+    ) || return 1
+  else
+    token=$(awk -F '"' '/"GITHUB_PERSONAL_ACCESS_TOKEN"[[:space:]]*:/ { print $4; exit }' "$1" 2>/dev/null) || return 1
+  fi
+
+  use_token "$token"
+}
+
+token_from_gh_hosts() {
+  [ -r "$1" ] || return 1
+  token=$(awk '
+    /^[[:space:]]*oauth_token:[[:space:]]*/ {
+      sub(/^[[:space:]]*oauth_token:[[:space:]]*/, "");
+      print;
+      exit;
+    }
+  ' "$1" 2>/dev/null) || return 1
+  use_token "$token"
+}
+
+load_token() {
+  use_token "${GITHUB_PERSONAL_ACCESS_TOKEN:-}" && return 0
+  use_token "${GITHUB_TOKEN:-}" && return 0
+
+  command -v pass >/dev/null 2>&1 && {
+    token=$(pass your-secret-store/github/personal-access-token 2>/dev/null) && use_token "$token" && return 0
+  }
+
+  for file in \
+    "$HOME/biz/scripts/github-manager/config.json" \
+    "YOUR_CREDENTIALS_PATH/mcp-configs/github-manager.json" \
+    "YOUR_CREDENTIALS_PATH/configs/github-manager.json" \
+    "YOUR_CREDENTIALS_PATH/mcp-configs/github-manager.json" \
+    "YOUR_CREDENTIALS_PATH/configs/github-manager.json"
+  do
+    token_from_json "$file" && return 0
+  done
+
+  for file in \
+    "YOUR_CREDENTIALS_PATH/cli/gh-hosts.yml" \
+    "YOUR_CREDENTIALS_PATH/cli/gh-hosts.yml" \
+    "$HOME/.config/gh/hosts.yml"
+  do
+    token_from_gh_hosts "$file" && return 0
+  done
+
+  return 1
+}
+
+if ! load_token; then
+  echo "github-mcp launcher: missing GitHub token; run cred-loader-sync or set GITHUB_PERSONAL_ACCESS_TOKEN" >&2
+  exit 1
+fi
+export GITHUB_PERSONAL_ACCESS_TOKEN
+
+exec github-mcp-server stdio --log-file "$HOME/biz/logs/github-mcp.log"

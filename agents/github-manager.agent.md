@@ -1,7 +1,6 @@
 ---
 name: github-manager
 description: Use this agent when you need to interact with GitHub for tasks such as managing repositories, issues, pull requests, branches, commits, or releases. This agent has exclusive access to GitHub operations via the gh CLI.
-model: claude-opus-4-6
 color: accent
 mode: subagent
 ---

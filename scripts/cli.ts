@@ -140,13 +140,10 @@ function runGhGraphQL(query: string, variables: Record<string, any>): string {
   }
 
   try {
-    const result = execFileSync("gh", args, {
-      encoding: "utf-8",
-      maxBuffer: 10 * 1024 * 1024,
-    });
-    return result;
-  } catch (error: any) {
-    throw new Error(`GitHub GraphQL query failed: ${error.message}`);
+    return runGh(args);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(`GitHub GraphQL query failed: ${reason}`);
   }
 }
 
@@ -1048,9 +1045,9 @@ export const commands = {
       const branch = args.branch as string | undefined;
 
       const query = branch ? `
-        query($owner: String!, $repo: String!, $first: Int!) {
+        query($owner: String!, $repo: String!, $first: Int!, $qualifiedName: String!) {
           repository(owner: $owner, name: $repo) {
-            ref(qualifiedName: "refs/heads/${branch}") {
+            ref(qualifiedName: $qualifiedName) {
               target {
                 ... on Commit {
                   history(first: $first) {
@@ -1077,7 +1074,10 @@ export const commands = {
         }
       `;
 
-      const resultJson = runGhGraphQL(query, { owner, repo, first: limit });
+      const variables = branch
+        ? { owner, repo, first: limit, qualifiedName: `refs/heads/${branch}` }
+        : { owner, repo, first: limit };
+      const resultJson = runGhGraphQL(query, variables);
       const result = JSON.parse(resultJson);
 
       if (result.errors) {

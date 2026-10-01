@@ -9,12 +9,14 @@ import {
   buildSafeOutput,
   TRUNCATION_DEFAULTS,
 } from "@local/cli-utils";
-import { execFileSync, spawnSync } from "child_process";
+import { execFileSync } from "child_process";
+import { realpathSync } from "fs";
 import {
+  extractLabelName,
   extractLogin,
   wrapIssueOrPrDetail,
 } from "./wrap.js";
-import { fileURLToPath } from "url";
+import { pathToFileURL } from "url";
 
 
 interface CommitNode {
@@ -60,13 +62,14 @@ function parseRepoArg(repoArg: string): { owner: string; repo: string } {
   return { owner: parts[0], repo: parts[1] };
 }
 
-type GhRunner = (args: string[]) => string;
+type GhRunner = (args: string[], input?: string) => string;
 
-function defaultRunGh(args: string[]): string {
+function defaultRunGh(args: string[], input?: string): string {
   try {
     const result = execFileSync("gh", args, {
       encoding: "utf-8",
       maxBuffer: 10 * 1024 * 1024,
+      input,
     });
     return result.trim();
   } catch (error: any) {
@@ -83,8 +86,8 @@ export function setRunGhForTests(runner: GhRunner | null): void {
   ghRunner = runner ?? defaultRunGh;
 }
 
-function runGh(args: string[]): string {
-  return ghRunner(args);
+function runGh(args: string[], input?: string): string {
+  return ghRunner(args, input);
 }
 
 function parseJson<T>(text: string, context: string): T {
@@ -372,15 +375,8 @@ export const commands = {
         url?: string;
       }>;
       const results = data.map((issue, i) => {
-        const authorLogin =
-          typeof issue.author === "object" && issue.author != null
-            ? (issue.author.login ?? "")
-            : String(issue.author ?? "");
-        const labelNames = Array.isArray(issue.labels)
-          ? issue.labels.map((l) =>
-              typeof l === "object" && l != null ? (l.name ?? "") : String(l ?? "")
-            )
-          : [];
+        const authorLogin = extractLogin(issue.author);
+        const labelNames = Array.isArray(issue.labels) ? issue.labels.map(extractLabelName) : [];
         return {
           number: issue.number,
           state: issue.state,
@@ -733,6 +729,8 @@ export const commands = {
       const { owner, repo } = parseRepoArg(args.repo as string);
       const result = runGh([
         "api",
+        "--method",
+        "GET",
         "--paginate",
         `repos/${owner}/${repo}/pulls/${args.number}/files`,
         "-F",
@@ -940,26 +938,22 @@ export const commands = {
       }
 
       const treePayload = JSON.stringify({ base_tree: baseTreeSha, tree: treeItems });
-      const treeResult = spawnSync("gh", [
+      const treeResult = runGh([
         "api", "-X", "POST",
         `repos/${owner}/${repo}/git/trees`,
         "--input", "-"
-      ], { input: treePayload, encoding: "utf-8" });
+      ], treePayload);
 
-      if (treeResult.error) throw new Error(`Failed to create tree: ${treeResult.error.message}`);
-      if (treeResult.status !== 0) throw new Error(`Failed to create tree: ${treeResult.stderr}`);
-      const treeData = JSON.parse(treeResult.stdout);
+      const treeData = JSON.parse(treeResult);
 
       const commitPayload = JSON.stringify({ message, tree: treeData.sha, parents: [parentSha] });
-      const newCommitResult = spawnSync("gh", [
+      const newCommitResult = runGh([
         "api", "-X", "POST",
         `repos/${owner}/${repo}/git/commits`,
         "--input", "-"
-      ], { input: commitPayload, encoding: "utf-8" });
+      ], commitPayload);
 
-      if (newCommitResult.error) throw new Error(`Failed to create commit: ${newCommitResult.error.message}`);
-      if (newCommitResult.status !== 0) throw new Error(`Failed to create commit: ${newCommitResult.stderr}`);
-      const newCommitData = JSON.parse(newCommitResult.stdout);
+      const newCommitData = JSON.parse(newCommitResult);
 
       runGh([
         "api", "-X", "PATCH",
@@ -1195,7 +1189,16 @@ export const commands = {
   ),
 };
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+let isCliEntry = false;
+try {
+  isCliEntry =
+    process.argv[1] !== undefined &&
+    import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
+} catch {
+  isCliEntry = false;
+}
+
+if (isCliEntry) {
   runCli(commands, GitHubCLI, {
     programName: "github-cli",
     description: "GitHub operations via gh CLI",
